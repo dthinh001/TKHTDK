@@ -20,7 +20,7 @@ const float SETPOINT_RPM = 100.0;
 const unsigned long SAMPLE_MS = 100;
 const float Ts = SAMPLE_MS / 1000.0;
 
-// PID/PI parameters from MATLAB
+// PI parameters from MATLAB
 const float Kp_R = 0.89395;
 const float Ki_R = 31.185;
 const float Kd_R = 0.0;
@@ -40,6 +40,10 @@ const int PWM_MAX = 255;
 // Integral limit to reduce windup
 const float I_LIMIT = 5.0;
 
+// Startup boost
+const unsigned long STARTUP_MAX_PWM_MS = 5000;
+const int STARTUP_PWM = 255;
+
 // ================= VARIABLES =================
 
 volatile long pulseL = 0;
@@ -55,6 +59,8 @@ float prevErrorL = 0;
 float prevErrorR = 0;
 
 unsigned long lastSample = 0;
+
+bool piStarted = false;
 
 // ================= INTERRUPT =================
 
@@ -73,6 +79,7 @@ void setMotorLeft(int pwm) {
 
   digitalWrite(IN1, HIGH);
   digitalWrite(IN2, LOW);
+
   analogWrite(ENA, pwm);
 }
 
@@ -81,6 +88,7 @@ void setMotorRight(int pwm) {
 
   digitalWrite(IN3, HIGH);
   digitalWrite(IN4, LOW);
+
   analogWrite(ENB, pwm);
 }
 
@@ -90,8 +98,27 @@ void stopMotor() {
 
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, LOW);
+
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
+}
+
+// ================= RESET FUNCTION =================
+
+void resetEncoderAndPI() {
+  noInterrupts();
+  pulseL = 0;
+  pulseR = 0;
+  interrupts();
+
+  lastPulseL = 0;
+  lastPulseR = 0;
+
+  integralL = 0;
+  integralR = 0;
+
+  prevErrorL = 0;
+  prevErrorR = 0;
 }
 
 // ================= SETUP =================
@@ -116,35 +143,128 @@ void setup() {
   stopMotor();
 
   Serial.println("==============================================================");
-  Serial.println("        DUAL MOTOR PI SPEED CONTROL");
+  Serial.println("        DUAL MOTOR PI SPEED CONTROL WITH STARTUP BOOST");
   Serial.println("==============================================================");
   Serial.println("Target RPM : 100");
   Serial.println("Sample Time: 100 ms");
+  Serial.println("Startup   : PWM = 255 for 5 seconds");
+  Serial.println();
   Serial.println("Left  PI: Kp = 0.65213, Ki = 46.801, Kd = 0");
   Serial.println("Right PI: Kp = 0.89395, Ki = 31.185, Kd = 0");
+  Serial.println("==============================================================");
   Serial.println();
-
-  Serial.println("Format:");
-  Serial.println("Time(ms) | RPM_L | RPM_R | PWM_L | PWM_R | Pulse_L | Pulse_R | Err_L | Err_R");
-  Serial.println("--------------------------------------------------------------");
 
   delay(2000);
 
-  noInterrupts();
-  pulseL = 0;
-  pulseR = 0;
-  interrupts();
+  // ==========================================================
+  // PHASE 1: STARTUP BOOST PWM 255
+  // ==========================================================
+
+  Serial.println("==============================================================");
+  Serial.println("PHASE 1 START: FULL PWM BOOST");
+  Serial.println("Both motors running at PWM = 255 for 5 seconds");
+  Serial.println("==============================================================");
+  Serial.println("Format:");
+  Serial.println("BOOST | Time(ms) | RPM_L | RPM_R | PWM_L | PWM_R | Pulse_L | Pulse_R");
+  Serial.println("--------------------------------------------------------------");
+
+  resetEncoderAndPI();
+
+  long boostLastPulseL = 0;
+  long boostLastPulseR = 0;
+
+  unsigned long boostStart = millis();
+  unsigned long lastBoostSample = boostStart;
+
+  setMotorLeft(STARTUP_PWM);
+  setMotorRight(STARTUP_PWM);
+
+  while (millis() - boostStart < STARTUP_MAX_PWM_MS) {
+    unsigned long now = millis();
+
+    if (now - lastBoostSample >= SAMPLE_MS) {
+      noInterrupts();
+      long currentPulseL = pulseL;
+      long currentPulseR = pulseR;
+      interrupts();
+
+      long dPulseL = currentPulseL - boostLastPulseL;
+      long dPulseR = currentPulseR - boostLastPulseR;
+
+      float rpmL = (dPulseL / (float)PPR) / Ts * 60.0;
+      float rpmR = (dPulseR / (float)PPR) / Ts * 60.0;
+
+      Serial.print("BOOST | Time=");
+      Serial.print(now - boostStart);
+      Serial.print(" ms");
+
+      Serial.print(" | RPM_L=");
+      Serial.print(rpmL, 1);
+
+      Serial.print(" | RPM_R=");
+      Serial.print(rpmR, 1);
+
+      Serial.print(" | PWM_L=");
+      Serial.print(STARTUP_PWM);
+
+      Serial.print(" | PWM_R=");
+      Serial.print(STARTUP_PWM);
+
+      Serial.print(" | Pulse_L=");
+      Serial.print(currentPulseL);
+
+      Serial.print(" | Pulse_R=");
+      Serial.println(currentPulseR);
+
+      boostLastPulseL = currentPulseL;
+      boostLastPulseR = currentPulseR;
+
+      lastBoostSample = now;
+    }
+  }
+
+  // ==========================================================
+  // DIRECT SWITCH TO PHASE 2, DO NOT STOP MOTORS
+  // ==========================================================
+
+  Serial.println("--------------------------------------------------------------");
+  Serial.println("PHASE 1 FINISHED");
+  Serial.println("Switching directly to PI control without stopping motors");
+  Serial.println("--------------------------------------------------------------");
+
+  Serial.println();
+  Serial.println("==============================================================");
+  Serial.println("RESETTING ENCODER AND PI VARIABLES");
+  Serial.println("Motors are still running, PI will take over immediately");
+  Serial.println("==============================================================");
+
+  resetEncoderAndPI();
 
   lastSample = millis();
+  piStarted = true;
+
+  // ==========================================================
+  // PHASE 2: PI CONTROL
+  // ==========================================================
+
+  Serial.println();
+  Serial.println("==============================================================");
+  Serial.println("PHASE 2 START: PI SPEED CONTROL");
+  Serial.println("==============================================================");
+  Serial.println("Target RPM : 100");
+  Serial.println("Format:");
+  Serial.println("PI | Time(ms) | RPM_L | RPM_R | PWM_L | PWM_R | Pulse_L | Pulse_R | Err_L | Err_R");
+  Serial.println("--------------------------------------------------------------");
 }
 
 // ================= LOOP =================
 
 void loop() {
+  if (!piStarted) return;
+
   unsigned long now = millis();
 
   if (now - lastSample >= SAMPLE_MS) {
-
     noInterrupts();
     long currentPulseL = pulseL;
     long currentPulseR = pulseR;
@@ -180,7 +300,7 @@ void loop() {
     setMotorLeft(pwmL);
     setMotorRight(pwmR);
 
-    Serial.print("Time=");
+    Serial.print("PI | Time=");
     Serial.print(now);
     Serial.print(" ms");
 
