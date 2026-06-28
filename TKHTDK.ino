@@ -13,20 +13,21 @@ const int PPR = 20;
 
 const float SETPOINT_RPM = 100.0;
 
-// Đổi từ 100ms lên 500ms
+// Thời gian lấy mẫu
 const unsigned long SAMPLE_MS = 500;
 const float Ts = SAMPLE_MS / 1000.0;
 
-// PI thực tế, nhẹ hơn MATLAB
-const float Kp_L = 0.20;
-const float Ki_L = 1.00;
+// PI giảm nhẹ để tránh kéo PWM quá mạnh
+const float Kp_L = 0.30;
+const float Ki_L = 0.35;
 
-const float Kp_R = 0.25;
-const float Ki_R = 1.00;
+const float Kp_R = 0.30;
+const float Ki_R = 0.35;
 
-// PWM nền gần vùng 100 rpm, có thể chỉnh sau
-const int BASE_PWM_L = 45;
-const int BASE_PWM_R = 50;
+// PWM nền
+// Bánh phải yếu hơn nên cho base phải cao hơn
+const int BASE_PWM_L = 75;
+const int BASE_PWM_R = 90;
 
 const int PWM_MIN = 0;
 const int PWM_MAX = 255;
@@ -37,7 +38,7 @@ const float I_LIMIT = 80.0;
 // Lọc EMA
 const float ALPHA = 0.35;
 
-// Phase 1
+// Phase 1: chạy full PWM để test tốc độ thực tế
 const unsigned long PHASE1_MS = 5000;
 const int PHASE1_PWM = 255;
 
@@ -54,8 +55,10 @@ float integralL = 0;
 float integralR = 0;
 
 unsigned long lastSample = 0;
+unsigned long phase2Start = 0;
 
 bool phase2Started = false;
+bool firstPhase2Sample = true;
 
 void isrL() {
   pulseL++;
@@ -87,6 +90,7 @@ void stopMotor() {
 
   digitalWrite(IN1, LOW);
   digitalWrite(IN2, LOW);
+
   digitalWrite(IN3, LOW);
   digitalWrite(IN4, LOW);
 }
@@ -127,14 +131,16 @@ void setup() {
   stopMotor();
 
   Serial.println("==============================================================");
-  Serial.println("        DUAL MOTOR PI SPEED CONTROL - 2 PHASE VERSION");
+  Serial.println("        DUAL MOTOR PI SPEED CONTROL - STABLE VERSION");
   Serial.println("==============================================================");
   Serial.println("Target RPM : 100");
   Serial.println("Sample Time: 500 ms");
-  Serial.println("Left  PI: Kp = 0.20, Ki = 1.00");
-  Serial.println("Right PI: Kp = 0.25, Ki = 1.00");
+  Serial.println("Left  PI: Kp = 0.30, Ki = 0.35");
+  Serial.println("Right PI: Kp = 0.30, Ki = 0.35");
+  Serial.println("Base PWM L/R: 75 / 90");
   Serial.println("Phase 1: PWM = 255 for 5 seconds");
-  Serial.println("Phase 2: PI control, switch directly without stopping motors");
+  Serial.println("Phase 2: lower to BASE PWM first, then PI control");
+  Serial.println("NOTE: Remove ENA/ENB jumpers if using Arduino PWM pins D5/D6");
   Serial.println("--------------------------------------------------------------");
 
   delay(2000);
@@ -207,12 +213,16 @@ void setup() {
     }
   }
 
-  // Không stop motor ở đây.
-  // Motor vẫn đang quay ở PWM 255, sau đó PI nhận quyền ngay.
+  // ==========================================================
+  // CHUYỂN PHA: KHÔNG STOP HẲN, NHƯNG HẠ VỀ PWM NỀN
+  // ==========================================================
+
+  setMotorLeft(BASE_PWM_L);
+  setMotorRight(BASE_PWM_R);
 
   Serial.println("--------------------------------------------------------------");
   Serial.println("PHASE 1 FINISHED");
-  Serial.println("Switching directly to PHASE 2 without stopping motors");
+  Serial.println("Lowering motors to BASE PWM before PHASE 2 PI control");
   Serial.println("--------------------------------------------------------------");
 
   // ==========================================================
@@ -222,12 +232,14 @@ void setup() {
   resetMeasureAndPI();
 
   lastSample = millis();
+  phase2Start = lastSample;
   phase2Started = true;
+  firstPhase2Sample = true;
 
   Serial.println();
   Serial.println("==============================================================");
   Serial.println("PHASE 2 START: PI SPEED CONTROL");
-  Serial.println("Motors are NOT stopped. PI takes over immediately.");
+  Serial.println("Motors are first lowered to BASE PWM. PI then takes over.");
   Serial.println("==============================================================");
   Serial.println("PHASE | Time(ms) | Raw_L | Raw_R | Filt_L | Filt_R | PWM_L | PWM_R | Pulse_L | Pulse_R | Err_L | Err_R");
   Serial.println("--------------------------------------------------------------");
@@ -250,32 +262,27 @@ void loop() {
     float rpmL_raw = (dPulseL / (float)PPR) / Ts * 60.0;
     float rpmR_raw = (dPulseR / (float)PPR) / Ts * 60.0;
 
-    rpmL_filtered = ALPHA * rpmL_raw + (1.0 - ALPHA) * rpmL_filtered;
-    rpmR_filtered = ALPHA * rpmR_raw + (1.0 - ALPHA) * rpmR_filtered;
+    // Mẫu đầu tiên phase 2: khởi tạo filter bằng raw luôn.
+    // Không để filtered bắt đầu từ 0, vì sẽ làm PI tưởng RPM quá thấp.
+    if (firstPhase2Sample) {
+      rpmL_filtered = rpmL_raw;
+      rpmR_filtered = rpmR_raw;
+      firstPhase2Sample = false;
+    } else {
+      rpmL_filtered = ALPHA * rpmL_raw + (1.0 - ALPHA) * rpmL_filtered;
+      rpmR_filtered = ALPHA * rpmR_raw + (1.0 - ALPHA) * rpmR_filtered;
+    }
 
     float errorL = SETPOINT_RPM - rpmL_filtered;
     float errorR = SETPOINT_RPM - rpmR_filtered;
 
+    // Cập nhật tích phân rồi kẹp lại.
+    // Không dùng anti-windup quá gắt để tránh bánh bị tụt chết.
     float candidateIntegralL = integralL + errorL * Ts;
     float candidateIntegralR = integralR + errorR * Ts;
 
-    float controlL_temp = Kp_L * errorL + Ki_L * candidateIntegralL;
-    float controlR_temp = Kp_R * errorR + Ki_R * candidateIntegralR;
-
-    int pwmL_temp = BASE_PWM_L + controlL_temp;
-    int pwmR_temp = BASE_PWM_R + controlR_temp;
-
-    // Anti-windup: chỉ cập nhật integral nếu PWM chưa bị kẹp
-    if (pwmL_temp > PWM_MIN && pwmL_temp < PWM_MAX) {
-      integralL = candidateIntegralL;
-    }
-
-    if (pwmR_temp > PWM_MIN && pwmR_temp < PWM_MAX) {
-      integralR = candidateIntegralR;
-    }
-
-    integralL = constrain(integralL, -I_LIMIT, I_LIMIT);
-    integralR = constrain(integralR, -I_LIMIT, I_LIMIT);
+    integralL = constrain(candidateIntegralL, -I_LIMIT, I_LIMIT);
+    integralR = constrain(candidateIntegralR, -I_LIMIT, I_LIMIT);
 
     float controlL = Kp_L * errorL + Ki_L * integralL;
     float controlR = Kp_R * errorR + Ki_R * integralR;
@@ -291,7 +298,7 @@ void loop() {
 
     Serial.print("P2");
     Serial.print(" | Time=");
-    Serial.print(now);
+    Serial.print(now - phase2Start);
     Serial.print(" ms");
 
     Serial.print(" | Raw_L=");
